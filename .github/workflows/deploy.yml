@@ -1,0 +1,75 @@
+name: Deploy to Bunny CDN
+
+on:
+  push:
+    branches:
+      - stg
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Stage site files
+        run: |
+          mkdir -p public
+          rsync -a --exclude='.git' --exclude='.jj' --exclude='.github' --exclude='public' ./ public/
+
+      - name: Upload to Bunny Storage
+        uses: ayeressian/bunnycdn-storage-deploy@74fd7566bd779b2921058dded239967782563abf # v2.2.2
+        with:
+          source: public
+          destination: /
+          storageZoneName: ringwood-io
+          storagePassword: ${{ secrets.BUNNY_STORAGE_PASSWORD }}
+          upload: "true"
+
+      - name: Clean up stale files
+        env:
+          STORAGE_PASSWORD: ${{ secrets.BUNNY_STORAGE_PASSWORD }}
+          STORAGE_ZONE: ringwood-io
+        run: |
+          # List all files in Bunny storage recursively
+          list_remote() {
+            local path="${1:-/}"
+            local entries
+            entries=$(curl -s -H "AccessKey: $STORAGE_PASSWORD" \
+              "https://storage.bunnycdn.com/$STORAGE_ZONE${path}")
+
+            echo "$entries" | jq -r '.[] | if .IsDirectory then .ObjectName + "/" else .ObjectName end' | while read -r name; do
+              if [[ "$name" == */ ]]; then
+                list_remote "${path}${name}"
+              else
+                echo "${path}${name}"
+              fi
+            done
+          }
+
+          # Build set of local files (relative paths with leading /)
+          local_files=$(cd public && find . -type f | sed 's|^\./|/|' | sort)
+
+          # Build set of remote files
+          remote_files=$(list_remote "/" | sort)
+
+          # Delete files in remote that aren't in local
+          stale=$(comm -23 <(echo "$remote_files") <(echo "$local_files"))
+
+          if [ -z "$stale" ]; then
+            echo "No stale files to remove."
+          else
+            echo "Removing stale files:"
+            echo "$stale"
+            echo "$stale" | while read -r file; do
+              curl -s -X DELETE -H "AccessKey: $STORAGE_PASSWORD" \
+                "https://storage.bunnycdn.com/$STORAGE_ZONE$file"
+            done
+          fi
+
+      - name: Purge pull zone cache
+        env:
+          BUNNY_API_KEY: ${{ secrets.BUNNY_API_KEY }}
+          PULLZONE_ID: ${{ secrets.BUNNY_PULLZONE_ID }}
+        run: |
+          curl -s -X POST -H "AccessKey: $BUNNY_API_KEY" \
+            "https://api.bunny.net/pullzone/$PULLZONE_ID/purgeCache"
